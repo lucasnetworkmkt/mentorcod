@@ -37,8 +37,13 @@ const LiveVoice: React.FC = () => {
   const sourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
   const nextStartTimeRef = useRef<number>(0);
   
-  // Session Ref (Holds the actual session object, not just the promise)
+  // Anti-Garbage Collection Refs (CRUCIAL FIX)
+  const processorRef = useRef<ScriptProcessorNode | null>(null);
+  const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  
+  // Session Management
   const activeSessionRef = useRef<any>(null);
+  const connectionStartTimeRef = useRef<number>(0);
 
   useEffect(() => {
     // Cleanup on unmount
@@ -57,7 +62,17 @@ const LiveVoice: React.FC = () => {
         activeSessionRef.current = null;
     }
 
-    // 2. Close Audio Contexts
+    // 2. Disconnect Audio Nodes (Critical to prevent memory leaks/GC issues)
+    if (processorRef.current) {
+        try { processorRef.current.disconnect(); } catch (e) {}
+        processorRef.current = null;
+    }
+    if (sourceRef.current) {
+        try { sourceRef.current.disconnect(); } catch (e) {}
+        sourceRef.current = null;
+    }
+
+    // 3. Close Audio Contexts
     if (inputAudioContextRef.current) {
         inputAudioContextRef.current.close().catch(() => {});
         inputAudioContextRef.current = null;
@@ -67,7 +82,7 @@ const LiveVoice: React.FC = () => {
         outputAudioContextRef.current = null;
     }
     
-    // 3. Stop all playing sounds
+    // 4. Stop all playing sounds
     sourcesRef.current.forEach(source => {
         try { source.stop(); } catch (e) {}
     });
@@ -108,6 +123,7 @@ const LiveVoice: React.FC = () => {
         callbacks: {
           onopen: () => {
             console.log("Conexão Live API aberta.");
+            connectionStartTimeRef.current = Date.now();
             nextStartTimeRef.current = 0;
             
             setStatus('connected');
@@ -115,16 +131,27 @@ const LiveVoice: React.FC = () => {
             setErrorMsg('');
             
             if (!inputAudioContextRef.current) return;
+
+            // Setup Audio Processing Chain
             const source = inputAudioContextRef.current.createMediaStreamSource(stream);
             const scriptProcessor = inputAudioContextRef.current.createScriptProcessor(4096, 1, 1);
             
-            scriptProcessor.onaudioprocess = (e) => {
-              // Only send data if we are active
-              if (!activeSessionRef.current) return;
+            // Store in refs to prevent Garbage Collection (Common cause of immediate stops)
+            sourceRef.current = source;
+            processorRef.current = scriptProcessor;
 
+            scriptProcessor.onaudioprocess = (e) => {
               const inputData = e.inputBuffer.getChannelData(0);
               const pcmBlob = createBlob(inputData);
-              activeSessionRef.current.sendRealtimeInput({ media: pcmBlob });
+              
+              // USE PROMISE HERE to avoid race condition if activeSessionRef isn't ready
+              sessionPromise.then((session) => {
+                  try {
+                    session.sendRealtimeInput({ media: pcmBlob });
+                  } catch (err) {
+                    // Ignore send errors (session might be closing)
+                  }
+              });
             };
             
             source.connect(scriptProcessor);
@@ -169,8 +196,16 @@ const LiveVoice: React.FC = () => {
                  setIsSpeaking(false);
              }
           },
-          onclose: () => {
-            console.log("Conexão fechada pelo servidor.");
+          onclose: (e) => {
+            console.log("Conexão fechada pelo servidor.", e);
+            
+            // Detect Immediate Disconnect (Crash)
+            const duration = Date.now() - connectionStartTimeRef.current;
+            if (duration < 2000) {
+                 setStatus('error');
+                 setErrorMsg("Desconexão súbita. Tente novamente ou verifique a internet.");
+            }
+            
             stopSession();
           },
           onerror: (err) => {
@@ -182,9 +217,10 @@ const LiveVoice: React.FC = () => {
                 message = "Acesso negado. Chave inválida.";
             }
 
+            // Simple retry logic
             if (retryCount < 1) {
                console.log("Tentando reconectar...");
-               stopSession(); // Clean cleanup before retry
+               stopSession(); 
                setTimeout(() => attemptConnection(retryCount + 1), 1500);
             } else {
                setStatus('error');
@@ -195,7 +231,6 @@ const LiveVoice: React.FC = () => {
         }
       });
       
-      // Wait for session and store it ref
       const session = await sessionPromise;
       activeSessionRef.current = session;
 
