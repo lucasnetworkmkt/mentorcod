@@ -34,7 +34,7 @@ const LiveVoice: React.FC = () => {
   // --- REFS DE INFRAESTRUTURA (CRÍTICO) ---
   const inputAudioContextRef = useRef<AudioContext | null>(null);
   const outputAudioContextRef = useRef<AudioContext | null>(null);
-  const streamRef = useRef<MediaStream | null>(null); // NEW: Segura o microfone
+  const streamRef = useRef<MediaStream | null>(null);
   const sourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
   const nextStartTimeRef = useRef<number>(0);
   
@@ -67,12 +67,10 @@ const LiveVoice: React.FC = () => {
         activeSessionRef.current = null;
     }
 
-    // 2. LIBERAR MICROFONE (A CORREÇÃO PRINCIPAL)
-    // Se não parar as tracks, a próxima tentativa falha instantaneamente.
+    // 2. LIBERAR MICROFONE
     if (streamRef.current) {
         streamRef.current.getTracks().forEach(track => {
             track.stop();
-            console.log("Microfone liberado:", track.label);
         });
         streamRef.current = null;
     }
@@ -106,13 +104,11 @@ const LiveVoice: React.FC = () => {
     if (!isCleaningUpRef.current) {
         setIsActive(false);
         setIsSpeaking(false);
-        // Se não foi erro, volta para disconnected
         if (status !== 'error') setStatus('disconnected');
     }
   };
 
   const startSession = async () => {
-    // Evita duplo clique
     if (status === 'connecting' || isActive) return;
 
     setErrorMsg('');
@@ -120,25 +116,19 @@ const LiveVoice: React.FC = () => {
     isCleaningUpRef.current = false;
 
     try {
-      // 1. INICIALIZAÇÃO SINCRONA DE AUDIO (Requisito do Navegador)
-      // O AudioContext deve ser criado DENTRO do evento de clique.
       const AudioContext = window.AudioContext || (window as any).webkitAudioContext;
       const inputCtx = new AudioContext({ sampleRate: 16000 });
       const outputCtx = new AudioContext({ sampleRate: 24000 });
       
-      // Força o desbloqueio do áudio imediatamente
+      // Resume contexts immediately (Browser Requirement)
       await inputCtx.resume();
       await outputCtx.resume();
 
-      // Salva refs
       inputAudioContextRef.current = inputCtx;
       outputAudioContextRef.current = outputCtx;
 
-      // 2. Obter Chave API
       const apiKey = await getVoiceApiKey();
       
-      // 3. Obter Microfone
-      // Agora pedimos o stream DEPOIS de criar os contextos
       const stream = await navigator.mediaDevices.getUserMedia({ 
           audio: {
               channelCount: 1,
@@ -148,11 +138,11 @@ const LiveVoice: React.FC = () => {
               autoGainControl: true
           } 
       });
-      streamRef.current = stream; // Salva para limpeza posterior
+      streamRef.current = stream;
 
-      // 4. Conectar na API Gemini
       const ai = new GoogleGenAI({ apiKey });
       
+      // Connect first, THEN setup audio flow
       const sessionPromise = ai.live.connect({
         model: 'gemini-2.5-flash-native-audio-preview-12-2025',
         config: {
@@ -169,27 +159,26 @@ const LiveVoice: React.FC = () => {
             setStatus('connected');
             setIsActive(true);
             
-            // Configura o processamento de áudio APÓS a conexão estar aberta
             if (!inputCtx || !streamRef.current) return;
 
             const source = inputCtx.createMediaStreamSource(streamRef.current);
-            const scriptProcessor = inputCtx.createScriptProcessor(4096, 1, 1);
+            // Reduced buffer size (2048) for lower latency and more frequent updates
+            const scriptProcessor = inputCtx.createScriptProcessor(2048, 1, 1);
             
-            // Refs anti-GC
             sourceRef.current = source;
             processorRef.current = scriptProcessor;
 
             scriptProcessor.onaudioprocess = (e) => {
-              if (!activeSessionRef.current) return; // Segurança extra
+              // OPTIMIZATION: Direct check, no Promise overhead in hot loop
+              if (!activeSessionRef.current) return; 
 
               const inputData = e.inputBuffer.getChannelData(0);
-              const pcmBlob = createBlob(inputData);
+              const pcmBlob = createBlobOptimized(inputData);
               
-              // Envia diretamente sem criar novas promises complexas
               try {
                  activeSessionRef.current.sendRealtimeInput({ media: pcmBlob });
               } catch (err) {
-                 // Ignora erros de envio se a sessão estiver fechando
+                 // Silent fail is okay here, session might be closing
               }
             };
             
@@ -199,17 +188,13 @@ const LiveVoice: React.FC = () => {
           onmessage: async (msg: LiveServerMessage) => {
              const base64Audio = msg.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
              
-             // ÁUDIO DO MODELO
              if (base64Audio && outputAudioContextRef.current) {
                 setIsSpeaking(true);
                 const ctx = outputAudioContextRef.current;
                 
-                // Decode
                 const audioBuffer = await decodeAudioData(decode(base64Audio), ctx, 24000, 1);
                 
-                // Scheduler
                 const now = ctx.currentTime;
-                // Se o tempo agendado já passou (gap), reseta para agora
                 if (nextStartTimeRef.current < now) nextStartTimeRef.current = now;
                 
                 const source = ctx.createBufferSource();
@@ -226,9 +211,7 @@ const LiveVoice: React.FC = () => {
                 sourcesRef.current.add(source);
              }
              
-             // INTERRUPÇÃO
              if (msg.serverContent?.interrupted) {
-                 console.log("Interrupção pelo usuário detectada");
                  sourcesRef.current.forEach(source => {
                      try { source.stop(); } catch(e){}
                  });
@@ -238,8 +221,7 @@ const LiveVoice: React.FC = () => {
              }
           },
           onclose: (e) => {
-            console.log("Evento Close recebido:", e);
-            // Só consideramos erro se a desconexão não foi intencional
+            console.log("Conexão fechada:", e);
             if (!isCleaningUpRef.current) {
                 setStatus('error');
                 setErrorMsg("Conexão perdida. Tente novamente.");
@@ -250,7 +232,7 @@ const LiveVoice: React.FC = () => {
             console.error("Erro Live API:", err);
             if (!isCleaningUpRef.current) {
                 setStatus('error');
-                setErrorMsg("Erro de conexão com o Mentor.");
+                setErrorMsg("Erro de conexão.");
                 stopSession();
             }
           }
@@ -261,33 +243,43 @@ const LiveVoice: React.FC = () => {
       activeSessionRef.current = session;
 
     } catch (error: any) {
-      console.error("Falha fatal no startSession:", error);
+      console.error("Falha no startSession:", error);
       setStatus('error');
       
       let msg = "Erro ao iniciar.";
-      if (error.name === 'NotAllowedError') msg = "Microfone bloqueado pelo navegador.";
-      if (error.message.includes('API key')) msg = "Chave de API inválida.";
+      if (error.name === 'NotAllowedError') msg = "Microfone bloqueado.";
       
       setErrorMsg(msg);
-      stopSession(true); // Força limpeza total
+      stopSession(true);
     }
   };
 
   // --- Helpers ---
-  function createBlob(data: Float32Array) {
+  
+  // Optimized Base64 conversion to prevent CPU spikes in audio loop
+  function createBlobOptimized(data: Float32Array) {
     const l = data.length;
+    // We can use a smaller buffer reuse strategy if needed, but new Int16Array is fast enough
     const int16 = new Int16Array(l);
     for (let i = 0; i < l; i++) {
-      // Clamp values to [-1, 1] before scaling prevents popping
-      let s = Math.max(-1, Math.min(1, data[i]));
+      // Clamp values [-1, 1]
+      let s = data[i];
+      if (s > 1) s = 1;
+      if (s < -1) s = -1;
       int16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
     }
+    
+    // Efficient binary string construction
     let binary = '';
     const bytes = new Uint8Array(int16.buffer);
     const len = bytes.byteLength;
-    for (let i = 0; i < len; i++) {
-        binary += String.fromCharCode(bytes[i]);
+    
+    // Process in chunks to avoid stack overflow with String.fromCharCode.apply
+    const CHUNK_SIZE = 8192;
+    for (let i = 0; i < len; i += CHUNK_SIZE) {
+        binary += String.fromCharCode.apply(null, Array.from(bytes.subarray(i, i + CHUNK_SIZE)));
     }
+    
     const b64 = btoa(binary);
     return { data: b64, mimeType: 'audio/pcm;rate=16000' };
   }
