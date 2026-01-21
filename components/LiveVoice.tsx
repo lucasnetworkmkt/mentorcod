@@ -1,7 +1,7 @@
 
 import React, { useEffect, useRef, useState } from 'react';
 import { GoogleGenAI, LiveServerMessage, Modality } from '@google/genai';
-import { Mic, MicOff, Radio, StopCircle, AlertCircle, RefreshCw } from 'lucide-react';
+import { MicOff, Radio, StopCircle, AlertCircle, RefreshCw, Volume2 } from 'lucide-react';
 import { getVoiceApiKey } from '../services/geminiService';
 
 const LIVE_VOICE_INSTRUCTION = `
@@ -31,38 +31,53 @@ const LiveVoice: React.FC = () => {
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [errorMsg, setErrorMsg] = useState('');
   
-  // Audio Context Refs
+  // --- REFS DE INFRAESTRUTURA (CRÍTICO) ---
   const inputAudioContextRef = useRef<AudioContext | null>(null);
   const outputAudioContextRef = useRef<AudioContext | null>(null);
+  const streamRef = useRef<MediaStream | null>(null); // NEW: Segura o microfone
   const sourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
   const nextStartTimeRef = useRef<number>(0);
   
-  // Anti-Garbage Collection Refs (CRUCIAL FIX)
+  // Refs para evitar Garbage Collection
   const processorRef = useRef<ScriptProcessorNode | null>(null);
   const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
   
-  // Session Management
+  // Sessão e Controle
   const activeSessionRef = useRef<any>(null);
-  const connectionStartTimeRef = useRef<number>(0);
+  const isCleaningUpRef = useRef(false);
 
   useEffect(() => {
-    // Cleanup on unmount
-    return () => stopSession();
+    // Cleanup ao desmontar o componente
+    return () => {
+        isCleaningUpRef.current = true;
+        stopSession(true);
+    };
   }, []);
 
-  const stopSession = () => {
-    // 1. Close Google GenAI Session
+  const stopSession = (force = false) => {
+    if (!force && status === 'disconnected') return;
+    
+    console.log("Encerrando sessão de voz...");
+
+    // 1. Fechar Sessão do Gemini
     if (activeSessionRef.current) {
         try {
             activeSessionRef.current.close();
-            console.log("Sessão GenAI encerrada.");
-        } catch (e) {
-            console.warn("Erro ao fechar sessão:", e);
-        }
+        } catch (e) { console.warn(e); }
         activeSessionRef.current = null;
     }
 
-    // 2. Disconnect Audio Nodes (Critical to prevent memory leaks/GC issues)
+    // 2. LIBERAR MICROFONE (A CORREÇÃO PRINCIPAL)
+    // Se não parar as tracks, a próxima tentativa falha instantaneamente.
+    if (streamRef.current) {
+        streamRef.current.getTracks().forEach(track => {
+            track.stop();
+            console.log("Microfone liberado:", track.label);
+        });
+        streamRef.current = null;
+    }
+
+    // 3. Desconectar Nós de Áudio
     if (processorRef.current) {
         try { processorRef.current.disconnect(); } catch (e) {}
         processorRef.current = null;
@@ -72,44 +87,71 @@ const LiveVoice: React.FC = () => {
         sourceRef.current = null;
     }
 
-    // 3. Close Audio Contexts
+    // 4. Fechar Contextos de Áudio
     if (inputAudioContextRef.current) {
-        inputAudioContextRef.current.close().catch(() => {});
+        try { inputAudioContextRef.current.close(); } catch (e) {}
         inputAudioContextRef.current = null;
     }
     if (outputAudioContextRef.current) {
-        outputAudioContextRef.current.close().catch(() => {});
+        try { outputAudioContextRef.current.close(); } catch (e) {}
         outputAudioContextRef.current = null;
     }
     
-    // 4. Stop all playing sounds
+    // 5. Parar sons
     sourcesRef.current.forEach(source => {
         try { source.stop(); } catch (e) {}
     });
     sourcesRef.current.clear();
     
-    setIsActive(false);
-    setIsSpeaking(false);
-    if (status !== 'error') setStatus('disconnected');
+    if (!isCleaningUpRef.current) {
+        setIsActive(false);
+        setIsSpeaking(false);
+        // Se não foi erro, volta para disconnected
+        if (status !== 'error') setStatus('disconnected');
+    }
   };
 
-  const attemptConnection = async (retryCount = 0) => {
-    try {
-      const apiKey = await getVoiceApiKey(); 
-      const ai = new GoogleGenAI({ apiKey });
-      
-      const AudioContext = window.AudioContext || (window as any).webkitAudioContext;
-      
-      // Initialize Contexts
-      inputAudioContextRef.current = new AudioContext({ sampleRate: 16000 });
-      outputAudioContextRef.current = new AudioContext({ sampleRate: 24000 });
-      
-      // CRITICAL: Resume output context immediately to unlock autoplay policies
-      if (outputAudioContextRef.current.state === 'suspended') {
-         await outputAudioContextRef.current.resume();
-      }
+  const startSession = async () => {
+    // Evita duplo clique
+    if (status === 'connecting' || isActive) return;
 
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    setErrorMsg('');
+    setStatus('connecting');
+    isCleaningUpRef.current = false;
+
+    try {
+      // 1. INICIALIZAÇÃO SINCRONA DE AUDIO (Requisito do Navegador)
+      // O AudioContext deve ser criado DENTRO do evento de clique.
+      const AudioContext = window.AudioContext || (window as any).webkitAudioContext;
+      const inputCtx = new AudioContext({ sampleRate: 16000 });
+      const outputCtx = new AudioContext({ sampleRate: 24000 });
+      
+      // Força o desbloqueio do áudio imediatamente
+      await inputCtx.resume();
+      await outputCtx.resume();
+
+      // Salva refs
+      inputAudioContextRef.current = inputCtx;
+      outputAudioContextRef.current = outputCtx;
+
+      // 2. Obter Chave API
+      const apiKey = await getVoiceApiKey();
+      
+      // 3. Obter Microfone
+      // Agora pedimos o stream DEPOIS de criar os contextos
+      const stream = await navigator.mediaDevices.getUserMedia({ 
+          audio: {
+              channelCount: 1,
+              sampleRate: 16000,
+              echoCancellation: true,
+              noiseSuppression: true,
+              autoGainControl: true
+          } 
+      });
+      streamRef.current = stream; // Salva para limpeza posterior
+
+      // 4. Conectar na API Gemini
+      const ai = new GoogleGenAI({ apiKey });
       
       const sessionPromise = ai.live.connect({
         model: 'gemini-2.5-flash-native-audio-preview-12-2025',
@@ -122,61 +164,58 @@ const LiveVoice: React.FC = () => {
         },
         callbacks: {
           onopen: () => {
-            console.log("Conexão Live API aberta.");
-            connectionStartTimeRef.current = Date.now();
+            console.log("Conexão WebSocket Aberta");
             nextStartTimeRef.current = 0;
-            
             setStatus('connected');
             setIsActive(true);
-            setErrorMsg('');
             
-            if (!inputAudioContextRef.current) return;
+            // Configura o processamento de áudio APÓS a conexão estar aberta
+            if (!inputCtx || !streamRef.current) return;
 
-            // Setup Audio Processing Chain
-            const source = inputAudioContextRef.current.createMediaStreamSource(stream);
-            const scriptProcessor = inputAudioContextRef.current.createScriptProcessor(4096, 1, 1);
+            const source = inputCtx.createMediaStreamSource(streamRef.current);
+            const scriptProcessor = inputCtx.createScriptProcessor(4096, 1, 1);
             
-            // Store in refs to prevent Garbage Collection (Common cause of immediate stops)
+            // Refs anti-GC
             sourceRef.current = source;
             processorRef.current = scriptProcessor;
 
             scriptProcessor.onaudioprocess = (e) => {
+              if (!activeSessionRef.current) return; // Segurança extra
+
               const inputData = e.inputBuffer.getChannelData(0);
               const pcmBlob = createBlob(inputData);
               
-              // USE PROMISE HERE to avoid race condition if activeSessionRef isn't ready
-              sessionPromise.then((session) => {
-                  try {
-                    session.sendRealtimeInput({ media: pcmBlob });
-                  } catch (err) {
-                    // Ignore send errors (session might be closing)
-                  }
-              });
+              // Envia diretamente sem criar novas promises complexas
+              try {
+                 activeSessionRef.current.sendRealtimeInput({ media: pcmBlob });
+              } catch (err) {
+                 // Ignora erros de envio se a sessão estiver fechando
+              }
             };
             
             source.connect(scriptProcessor);
-            scriptProcessor.connect(inputAudioContextRef.current.destination);
+            scriptProcessor.connect(inputCtx.destination);
           },
           onmessage: async (msg: LiveServerMessage) => {
              const base64Audio = msg.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
+             
+             // ÁUDIO DO MODELO
              if (base64Audio && outputAudioContextRef.current) {
                 setIsSpeaking(true);
                 const ctx = outputAudioContextRef.current;
                 
-                if (ctx.state === 'suspended') await ctx.resume();
-
-                nextStartTimeRef.current = Math.max(nextStartTimeRef.current, ctx.currentTime);
+                // Decode
+                const audioBuffer = await decodeAudioData(decode(base64Audio), ctx, 24000, 1);
                 
-                const audioBuffer = await decodeAudioData(
-                   decode(base64Audio),
-                   ctx,
-                   24000,
-                   1
-                );
+                // Scheduler
+                const now = ctx.currentTime;
+                // Se o tempo agendado já passou (gap), reseta para agora
+                if (nextStartTimeRef.current < now) nextStartTimeRef.current = now;
                 
                 const source = ctx.createBufferSource();
                 source.buffer = audioBuffer;
                 source.connect(ctx.destination);
+                
                 source.addEventListener('ended', () => {
                     sourcesRef.current.delete(source);
                     if (sourcesRef.current.size === 0) setIsSpeaking(false);
@@ -187,7 +226,9 @@ const LiveVoice: React.FC = () => {
                 sourcesRef.current.add(source);
              }
              
+             // INTERRUPÇÃO
              if (msg.serverContent?.interrupted) {
+                 console.log("Interrupção pelo usuário detectada");
                  sourcesRef.current.forEach(source => {
                      try { source.stop(); } catch(e){}
                  });
@@ -197,35 +238,20 @@ const LiveVoice: React.FC = () => {
              }
           },
           onclose: (e) => {
-            console.log("Conexão fechada pelo servidor.", e);
-            
-            // Detect Immediate Disconnect (Crash)
-            const duration = Date.now() - connectionStartTimeRef.current;
-            if (duration < 2000) {
-                 setStatus('error');
-                 setErrorMsg("Desconexão súbita. Tente novamente ou verifique a internet.");
+            console.log("Evento Close recebido:", e);
+            // Só consideramos erro se a desconexão não foi intencional
+            if (!isCleaningUpRef.current) {
+                setStatus('error');
+                setErrorMsg("Conexão perdida. Tente novamente.");
+                stopSession();
             }
-            
-            stopSession();
           },
           onerror: (err) => {
-            console.error("Live API Error:", err);
-            let message = "Erro de conexão.";
-            if (err.message?.includes("unavailable") || err.message?.includes("503")) {
-                message = "Serviço sobrecarregado. Tente novamente.";
-            } else if (err.message?.includes("permission") || err.message?.includes("403")) {
-                message = "Acesso negado. Chave inválida.";
-            }
-
-            // Simple retry logic
-            if (retryCount < 1) {
-               console.log("Tentando reconectar...");
-               stopSession(); 
-               setTimeout(() => attemptConnection(retryCount + 1), 1500);
-            } else {
-               setStatus('error');
-               setErrorMsg(message);
-               stopSession();
+            console.error("Erro Live API:", err);
+            if (!isCleaningUpRef.current) {
+                setStatus('error');
+                setErrorMsg("Erro de conexão com o Mentor.");
+                stopSession();
             }
           }
         }
@@ -235,17 +261,16 @@ const LiveVoice: React.FC = () => {
       activeSessionRef.current = session;
 
     } catch (error: any) {
-      console.error("Connection failed:", error);
+      console.error("Falha fatal no startSession:", error);
       setStatus('error');
-      setErrorMsg(error.message || "Erro ao iniciar. Verifique microfone.");
-      stopSession();
+      
+      let msg = "Erro ao iniciar.";
+      if (error.name === 'NotAllowedError') msg = "Microfone bloqueado pelo navegador.";
+      if (error.message.includes('API key')) msg = "Chave de API inválida.";
+      
+      setErrorMsg(msg);
+      stopSession(true); // Força limpeza total
     }
-  };
-
-  const startSession = () => {
-     setStatus('connecting');
-     setErrorMsg('');
-     attemptConnection();
   };
 
   // --- Helpers ---
@@ -253,7 +278,9 @@ const LiveVoice: React.FC = () => {
     const l = data.length;
     const int16 = new Int16Array(l);
     for (let i = 0; i < l; i++) {
-      int16[i] = data[i] * 32768;
+      // Clamp values to [-1, 1] before scaling prevents popping
+      let s = Math.max(-1, Math.min(1, data[i]));
+      int16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
     }
     let binary = '';
     const bytes = new Uint8Array(int16.buffer);
@@ -344,7 +371,7 @@ const LiveVoice: React.FC = () => {
             </button>
           ) : isActive || status === 'connecting' ? (
             <button 
-              onClick={stopSession}
+              onClick={() => stopSession(false)}
               className="bg-[#333] hover:bg-[#222] text-white border border-[#555] px-8 py-4 rounded-full font-bold uppercase tracking-widest flex items-center gap-3 transition-all hover:border-[#E50914] active:scale-95 text-sm sm:text-base"
             >
               <StopCircle size={24} />
