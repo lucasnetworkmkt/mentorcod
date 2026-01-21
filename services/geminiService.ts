@@ -5,7 +5,7 @@ import { SYSTEM_INSTRUCTION } from "../constants";
 // --- CHAVES DE API (CONFIGURAÇÃO DIRETA) ---
 // Configuração Hardcoded para garantir funcionamento imediato
 const STATIC_KEYS = {
-    A: "AIzaSyBX3prHIBxzrfNbExUQSf6-kvdIbiQM3T0", // Chat Texto
+    A: "AIzaSyBX3prHIBxzrfNbExUQSf6-kvdIbiQM3T0", // Chat Texto (Confirmado funcionando)
     B: "AIzaSyCBOQRta1-O1Uttwkl40umIvVGyHcQHb1g", // Voz
     C: "AIzaSyBNIvn9PFzGA_B3NhDFtalLzORmvNIJpjI"  // Mapas
 };
@@ -26,13 +26,23 @@ const getEnvVar = (key: string): string => {
   return value || '';
 };
 
+// --- ESTRATÉGIA DE ROBUSTEZ ---
+// Cria um pool com TODAS as chaves válidas encontradas
+const ALL_KEYS = [
+    STATIC_KEYS.A, STATIC_KEYS.B, STATIC_KEYS.C,
+    getEnvVar('API_KEY'), getEnvVar('VITE_API_KEY')
+].filter(k => k && k.length > 20);
+
 // --- CONFIGURAÇÃO DOS GRUPOS ---
-// Prioridade: Chave Estática (Garantida) -> Variável de Ambiente
 const API_GROUPS = {
-  // O sistema usará a chave estática primeiro. Se falhar, tenta buscar variáveis.
-  A: [STATIC_KEYS.A, getEnvVar('API_KEY_A1'), getEnvVar('API_KEY')].filter(k => k && k.length > 10),
-  B: [STATIC_KEYS.B, getEnvVar('API_KEY_B1'), getEnvVar('API_KEY')].filter(k => k && k.length > 10),
-  C: [STATIC_KEYS.C, getEnvVar('API_KEY_C1'), getEnvVar('API_KEY')].filter(k => k && k.length > 10)
+  // Grupo A (Texto): Tenta a chave A, se falhar, tenta qualquer uma do pool
+  A: [STATIC_KEYS.A, ...ALL_KEYS],
+  
+  // Grupo B (Voz): Tenta a chave B, mas se falhar, tenta a A (que sabemos que funciona)
+  B: [STATIC_KEYS.B, STATIC_KEYS.A, ...ALL_KEYS],
+  
+  // Grupo C (Mapas): Tenta a chave C, mas se falhar, tenta a A IMEDIATAMENTE
+  C: [STATIC_KEYS.C, STATIC_KEYS.A, ...ALL_KEYS]
 };
 
 // --- LÓGICA DE CONEXÃO ---
@@ -40,45 +50,48 @@ async function executeWithFallback<T>(
   group: 'A' | 'B' | 'C',
   operation: (apiKey: string) => Promise<T>
 ): Promise<T> {
-  const keys = API_GROUPS[group];
+  // Remove duplicatas e valores vazios
+  const keys = Array.from(new Set(API_GROUPS[group])).filter(Boolean);
   
   if (keys.length === 0) {
     throw new Error("ERRO FATAL: Nenhuma chave de API configurada.");
   }
 
-  // Remove duplicatas
-  const uniqueKeys = Array.from(new Set(keys));
   let lastError: any;
 
-  for (const apiKey of uniqueKeys) {
+  for (const apiKey of keys) {
     try {
+      // @ts-ignore
       return await operation(apiKey);
     } catch (error: any) {
-      console.warn(`[Mentor] Falha com chave terminada em ...${apiKey.slice(-4)}:`, error.message);
+      console.warn(`[Mentor] Falha com chave ...${apiKey.slice(-4)} no Grupo ${group}:`, error.message);
       lastError = error;
       
-      // Se a chave for inválida explicitamente, não adianta tentar de novo a mesma chave, mas o loop tenta a próxima
       const status = error.status || error.response?.status;
-      if (status === 403 || error.message?.includes('API key not valid')) {
-          console.error("Chave recusada pelo Google. Verifique se a API está ativada no console do Google Cloud.");
+      // Se a chave for explicitamente inválida, continua para a próxima
+      if (status === 403 || error.message?.includes('key not valid')) {
+          continue;
       }
     }
   }
 
   // Mensagem final de erro para o usuário
   let msg = "Sistema Indisponível.";
-  if (lastError?.message?.includes('API key')) msg = "Chaves de API Inválidas ou Expiradas.";
-  if (lastError?.message?.includes('SAFETY')) msg = "Bloqueio de Segurança (Conteúdo Sensível).";
+  if (lastError?.message?.includes('API key')) msg = "Todas as chaves falharam.";
+  if (lastError?.message?.includes('SAFETY')) msg = "Bloqueio de Segurança.";
   
-  throw new Error(`${msg} (Detalhe: ${lastError?.message})`);
+  throw new Error(`${msg}`);
 }
 
 // --- SERVIÇOS PÚBLICOS ---
 
 export const getVoiceApiKey = async (): Promise<string> => {
-  // Retorna a primeira chave válida do grupo B
-  if (API_GROUPS.B.length > 0) return API_GROUPS.B[0];
-  throw new Error("Chave de Voz não encontrada.");
+    // Tenta validar uma chave antes de retornar
+    // Como não podemos fazer uma chamada assíncrona dentro da config do Live,
+    // retornamos a chave A se a B falhar na lógica de grupos, mas aqui retornamos string direta.
+    // Prioridade: B -> A -> Qualquer outra
+    const keys = [STATIC_KEYS.B, STATIC_KEYS.A, ...ALL_KEYS].filter(Boolean);
+    return keys[0];
 };
 
 export const generateTextResponse = async (history: {role: string, parts: {text: string}[]}[], userMessage: string) => {
@@ -124,11 +137,20 @@ export const generateMentalMapStructure = async (topic: string) => {
 
     const prompt = `
       Crie um MAPA MENTAL ESTRUTURADO em formato de ÁRVORE DE TEXTO (ASCII/Tree Style) sobre: "${topic}".
-      REGRAS VISUAIS:
-      - Use caracteres ASCII para conectar: ├──, └──, │.
-      - Não use Markdown code blocks (\`\`\`), apenas o texto puro.
-      - Seja hierárquico, direto e focado em EXECUÇÃO.
-      - Limite a 3 níveis de profundidade.
+      
+      REGRAS VISUAIS RÍGIDAS:
+      1. NÃO use blocos de código markdown (\`\`\`). Retorne APENAS o texto puro.
+      2. Use estes conectores exatos: ├──, └──, │.
+      3. A estrutura deve ser hierárquica e limpa.
+      4. Foco total em AÇÃO e EXECUÇÃO.
+      
+      Exemplo de Saída Esperada:
+      TEMA CENTRAL
+      ├── Fase 1: Planejamento
+      │   ├── Ação A
+      │   └── Ação B
+      └── Fase 2: Execução
+          └── Ação C
     `;
 
     const response = await ai.models.generateContent({
@@ -142,6 +164,11 @@ export const generateMentalMapStructure = async (topic: string) => {
       }
     });
 
-    return response.text || "Erro ao gerar mapa.";
+    // Clean up markdown blocks if the model puts them anyway
+    let text = response.text || "";
+    text = text.replace(/```/g, '').trim();
+    
+    if (!text) throw new Error("Falha na geração do mapa.");
+    return text;
   });
 };

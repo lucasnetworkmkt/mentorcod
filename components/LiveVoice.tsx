@@ -1,3 +1,4 @@
+
 import React, { useEffect, useRef, useState } from 'react';
 import { GoogleGenAI, LiveServerMessage, Modality } from '@google/genai';
 import { Mic, MicOff, Radio, StopCircle, AlertCircle, RefreshCw } from 'lucide-react';
@@ -35,20 +36,38 @@ const LiveVoice: React.FC = () => {
   const outputAudioContextRef = useRef<AudioContext | null>(null);
   const sourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
   const nextStartTimeRef = useRef<number>(0);
-  const sessionRef = useRef<any>(null);
+  
+  // Session Ref (Holds the actual session object, not just the promise)
+  const activeSessionRef = useRef<any>(null);
+
+  useEffect(() => {
+    // Cleanup on unmount
+    return () => stopSession();
+  }, []);
 
   const stopSession = () => {
-    // Close audio contexts to release hardware
+    // 1. Close Google GenAI Session
+    if (activeSessionRef.current) {
+        try {
+            activeSessionRef.current.close();
+            console.log("Sessão GenAI encerrada.");
+        } catch (e) {
+            console.warn("Erro ao fechar sessão:", e);
+        }
+        activeSessionRef.current = null;
+    }
+
+    // 2. Close Audio Contexts
     if (inputAudioContextRef.current) {
         inputAudioContextRef.current.close().catch(() => {});
+        inputAudioContextRef.current = null;
     }
     if (outputAudioContextRef.current) {
         outputAudioContextRef.current.close().catch(() => {});
+        outputAudioContextRef.current = null;
     }
-    inputAudioContextRef.current = null;
-    outputAudioContextRef.current = null;
     
-    // Cleanup sources
+    // 3. Stop all playing sounds
     sourcesRef.current.forEach(source => {
         try { source.stop(); } catch (e) {}
     });
@@ -56,7 +75,7 @@ const LiveVoice: React.FC = () => {
     
     setIsActive(false);
     setIsSpeaking(false);
-    setStatus('disconnected');
+    if (status !== 'error') setStatus('disconnected');
   };
 
   const attemptConnection = async (retryCount = 0) => {
@@ -88,8 +107,7 @@ const LiveVoice: React.FC = () => {
         },
         callbacks: {
           onopen: () => {
-            // BUG FIX: Reset the audio scheduling time when a new session starts.
-            // If not reset, it might schedule audio far in the future based on previous session's context.
+            console.log("Conexão Live API aberta.");
             nextStartTimeRef.current = 0;
             
             setStatus('connected');
@@ -101,11 +119,12 @@ const LiveVoice: React.FC = () => {
             const scriptProcessor = inputAudioContextRef.current.createScriptProcessor(4096, 1, 1);
             
             scriptProcessor.onaudioprocess = (e) => {
+              // Only send data if we are active
+              if (!activeSessionRef.current) return;
+
               const inputData = e.inputBuffer.getChannelData(0);
               const pcmBlob = createBlob(inputData);
-              sessionPromise.then(session => {
-                  session.sendRealtimeInput({ media: pcmBlob });
-              });
+              activeSessionRef.current.sendRealtimeInput({ media: pcmBlob });
             };
             
             source.connect(scriptProcessor);
@@ -117,10 +136,8 @@ const LiveVoice: React.FC = () => {
                 setIsSpeaking(true);
                 const ctx = outputAudioContextRef.current;
                 
-                // Ensure context is running if it suspended during idle
                 if (ctx.state === 'suspended') await ctx.resume();
 
-                // Ensure we don't schedule in the past
                 nextStartTimeRef.current = Math.max(nextStartTimeRef.current, ctx.currentTime);
                 
                 const audioBuffer = await decodeAudioData(
@@ -143,33 +160,31 @@ const LiveVoice: React.FC = () => {
                 sourcesRef.current.add(source);
              }
              
-             // Handle interruptions
              if (msg.serverContent?.interrupted) {
                  sourcesRef.current.forEach(source => {
                      try { source.stop(); } catch(e){}
                  });
                  sourcesRef.current.clear();
                  nextStartTimeRef.current = 0;
+                 setIsSpeaking(false);
              }
           },
           onclose: () => {
+            console.log("Conexão fechada pelo servidor.");
             stopSession();
           },
           onerror: (err) => {
             console.error("Live API Error:", err);
-            // Handle specific connection errors
             let message = "Erro de conexão.";
             if (err.message?.includes("unavailable") || err.message?.includes("503")) {
                 message = "Serviço sobrecarregado. Tente novamente.";
             } else if (err.message?.includes("permission") || err.message?.includes("403")) {
-                message = "Acesso negado. Verifique a chave.";
+                message = "Acesso negado. Chave inválida.";
             }
 
             if (retryCount < 1) {
                console.log("Tentando reconectar...");
-               // Clean up before retry but keep UI in connecting state
-               inputAudioContextRef.current?.close();
-               outputAudioContextRef.current?.close();
+               stopSession(); // Clean cleanup before retry
                setTimeout(() => attemptConnection(retryCount + 1), 1500);
             } else {
                setStatus('error');
@@ -180,12 +195,15 @@ const LiveVoice: React.FC = () => {
         }
       });
       
-      sessionRef.current = sessionPromise;
+      // Wait for session and store it ref
+      const session = await sessionPromise;
+      activeSessionRef.current = session;
 
     } catch (error: any) {
       console.error("Connection failed:", error);
       setStatus('error');
-      setErrorMsg(error.message || "Erro ao iniciar. Verifique permissões.");
+      setErrorMsg(error.message || "Erro ao iniciar. Verifique microfone.");
+      stopSession();
     }
   };
 
